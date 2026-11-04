@@ -182,7 +182,7 @@ async def chat_completions(request: Request):
                         extracted_files[match.group(1)] = match.group(2)
             if extracted_files:
                 rep = guard_engine.inspect_turn(session_id, extracted_files, advance_turn=True)
-                stale_memories = len(rep.get("stale_symbols", []))
+                stale_memories = rep.stale_count if hasattr(rep, 'stale_count') else len(rep.mutated_symbols)
             else:
                 stale_memories = 0
         except Exception as e:
