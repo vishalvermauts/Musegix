@@ -1,90 +1,76 @@
-# Phase 4: Model Context Protocol (MCP) Server & Visual UI Render Gate
+# Phase 4: FastMCP Tool Server & Real DOM Render Verification Gate
 
-> **Status:** Pending Phase 3 Completion  
-> **Objective:** Expose `PolyFabric`, `Veylqora`, and a real headless screenshot visual verification gate as Model Context Protocol (MCP) tools directly queryable from `bolt.diy`'s chat or automated verification loops.
+> **Status:** Queued (Follows Phase 3)  
+> **Objective:** Expose developer intelligence tools over Model Context Protocol (MCP) and provide an honest headless browser verification gate that checks WebContainer DOM layout collisions and console errors.
 
 ---
 
-## 1. MCP Server Architecture (`mcp_servers/musegix_mcp.py`)
+## 1. FastMCP Server Specification (`mcp_servers/musegix_mcp.py`)
 
-Using `FastMCP` from the official Model Context Protocol Python SDK, we expose 3 tools:
-1. `polyfabric_symbol_search(query: str, top_k: int = 5)`: Returns exact line-bounded AST code definitions.
-2. `veylqora_memory_inspect(file_path: str)`: Inspects active vs `suspected_stale` memories in SQLite WAL.
-3. `ui_visual_render_gate(preview_url: str)`: Uses Playwright to take a headless screenshot of the running preview, checks for DOM render errors, and outputs segmentation bounds.
+Tools exposed to `bolt.diy`:
+1. `polyfabric_symbol_search(query: str)`: Searches indexed workspace symbols for targeted definitions.
+2. `veylqora_memory_inspect(file_path: str)`: Reports anchored memory states (`ACTIVE`, `SUSPECTED_STALE`, `EVIDENCE_MISSING`).
+3. `ui_visual_render_gate(preview_url: str)`: Runs headless Chromium via Playwright to verify DOM integrity.
 
-### Implementation
+---
+
+## 2. Real Playwright DOM Verification Gate
+
+Unlike canned mock responses, this launches headless Chromium, waits for the WebContainer preview to mount, and analyzes DOM geometry:
+
 ```python
-import os
 import time
-from mcp.server.fastmcp import FastMCP
+from playwright.async_api import async_playwright
 
-mcp = FastMCP("Musegix-MCP")
-
-@mcp.tool()
-def polyfabric_symbol_search(query: str, top_k: int = 5) -> dict:
-    """
-    Search for precise Tree-sitter AST symbol intervals across the indexed codebase.
-    """
+async def verify_webcontainer_dom(preview_url: str) -> dict:
     t0 = time.perf_counter()
-    # Query PolyFabric engine
-    return {
-        "engine": "PolyFabric AST Search",
-        "query": query,
-        "symbols": [
-            {"file": "src/components/Header.tsx", "symbol": "HeaderBar", "lines": "12-34"},
-            {"file": "src/hooks/useAuth.ts", "symbol": "useAuth", "lines": "5-28"}
-        ],
-        "latency_ms": round((time.perf_counter() - t0) * 1000, 2)
-    }
+    errors = []
+    
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page(viewport={"width": 1280, "height": 800})
+        
+        # Capture console errors
+        page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        
+        try:
+            await page.goto(preview_url, wait_until="networkidle", timeout=8000)
+        except Exception as e:
+            await browser.close()
+            return {"status": "UNAVAILABLE", "error": f"Preview unreachable: {str(e)}"}
+            
+        # Check horizontal overflow
+        has_overflow = await page.evaluate("document.documentElement.scrollWidth > window.innerWidth")
+        
+        # Check interactive element counts
+        elements = await page.evaluate("""() => {
+            return [...document.querySelectorAll('button, a, input, nav, header')].map(e => {
+                const r = e.getBoundingClientRect();
+                return { tag: e.tagName, w: r.width, h: r.height };
+            }).filter(b => b.w > 0 && b.h > 0);
+        }""")
+        
+        await browser.close()
 
-@mcp.tool()
-def veylqora_memory_inspect(file_path: str) -> dict:
-    """
-    Check if any active agent memory associated with file_path is SUSPECTED_STALE.
-    """
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+    passed = len(errors) == 0 and not has_overflow and len(elements) > 0
+    
     return {
-        "engine": "Veylqora SQLite WAL",
-        "file": file_path,
-        "status": "ACTIVE",
-        "stale_warnings": 0
+        "status": "PASSED" if passed else "FAILED",
+        "elements_verified": len(elements),
+        "console_errors": errors[:5],
+        "horizontal_overflow": has_overflow,
+        "latency_ms": elapsed_ms
     }
-
-@mcp.tool()
-async def ui_visual_render_gate(preview_url: str = "http://localhost:5173") -> dict:
-    """
-    Captures the running WebContainer preview and verifies zero layout collisions or CSS overflow.
-    """
-    t0 = time.perf_counter()
-    # Uses headless browser to check DOM health and console errors
-    return {
-        "status": "PASSED",
-        "target_url": preview_url,
-        "dom_elements_verified": 42,
-        "console_errors": 0,
-        "render_latency_ms": round((time.perf_counter() - t0) * 1000, 2)
-    }
-
-if __name__ == "__main__":
-    mcp.run()
 ```
-
----
-
-## 2. Registering MCP in `bolt.diy`
-
-In `bolt.diy`:
-1. Navigate to **Settings (⚙️) → Features / MCP Tools**.
-2. Add custom server:
-   - **Name:** `Musegix Tools`
-   - **Command:** `python3`
-   - **Args:** `["mcp_servers/musegix_mcp.py"]`
 
 ---
 
 ## 3. Phase 4 Certification Gate Checklist
 
-- [ ] **Gate 4.1:** FastMCP server starts and passes MCP JSON-RPC protocol initialization tests.
-- [ ] **Gate 4.2:** `polyfabric_symbol_search` returns valid structured symbol intervals over stdio.
-- [ ] **Gate 4.3:** `veylqora_memory_inspect` accurately reports SQLite WAL symbol status.
-- [ ] **Gate 4.4:** `ui_visual_render_gate` runs headlessly and returns clean DOM status.
-- [ ] **Gate 4.5:** `bolt.diy` successfully queries the MCP server tools during live chat sessions.
+- [ ] **Gate 4.1:** FastMCP server responds cleanly to MCP protocol initialization.
+- [ ] **Gate 4.2:** Playwright installs and runs in the cloud sandbox without missing OS libraries.
+- [ ] **Gate 4.3:** `ui_visual_render_gate` correctly detects a deliberate runtime console error.
+- [ ] **Gate 4.4:** `ui_visual_render_gate` returns `PASSED` on a clean, valid WebContainer preview.
+- [ ] **Gate 4.5:** `bolt.diy` can invoke MCP tools over stdio during chat sessions.

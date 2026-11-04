@@ -161,3 +161,4 @@ To certify Phase 1 as COMPLETE, all following gates must pass:
 - [ ] **Gate 1.3:** `gateway/app.py` boots cleanly with Uvicorn on port 8000 without missing module errors.
 - [ ] **Gate 1.4:** `curl http://localhost:8000/v1/models` returns valid OpenAI-compatible model list JSON.
 - [ ] **Gate 1.5:** GitHub repo `https://github.com/vishalvermauts/Musegix.git` has master branch initialized and passing GitHub Actions CI.
+

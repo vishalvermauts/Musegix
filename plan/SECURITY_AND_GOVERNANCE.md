@@ -50,3 +50,4 @@ Because Musegix operates as an intermediary proxy between an untrusted browser I
 - [ ] Invariant 2: **Sandboxed File Operations:** No file write operations outside WebContainer virtual file system.
 - [ ] Invariant 3: **Path Traversal Guard:** Regex reject any `<boltAction filePath="..*">` occurrences.
 - [ ] Invariant 4: **Fail-Closed Routing:** If ONNX classifier or upstream API fails, return clean HTTP error; never crash silent or leak stack traces.
+
