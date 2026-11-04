@@ -53,6 +53,19 @@ def get_pruner() -> PolyFabricPruner:
     return _pruner
 
 
+def _chat_session_id(messages) -> str:
+    """bolt.diy sends no chat id; the first user message is stable within one chat."""
+    import hashlib
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            if isinstance(c, str) and c.strip():
+                return "chat_" + hashlib.sha256(c.strip()[:500].encode("utf-8")).hexdigest()[:16]
+    return "bolt-session-default"
+
+
 def get_guard() -> VeylqoraGuard:
     global _guard
     if _guard is None:
@@ -197,6 +210,14 @@ async def chat_completions(request: Request):
     stale_memories = None
 
     if not is_aux:
+        # Veylqora must fingerprint the ORIGINAL files, not PolyFabric's pruned stubs,
+        # otherwise every pruned background file looks "mutated".
+        original_files = {}
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") != "system" and isinstance(m.get("content"), str):
+                for match in re.finditer(r'<boltAction\s+type="file"\s+filePath="([^"]+)">\s*(.*?)\s*</boltAction>', m["content"], re.DOTALL):
+                    original_files[match.group(1)] = match.group(2)
+
         # Check if there is bolt multi-file context to prune
         for msg in messages:
             # System prompts hold bolt.diy's <boltAction> *examples*; never rewrite instructions.
@@ -223,13 +244,8 @@ async def chat_completions(request: Request):
         # Veylqora session check
         try:
             guard_engine = get_guard()
-            session_id = body.get("session_id", "bolt-session-default")
-            # Extract file dictionary if available in prompt
-            extracted_files = {}
-            for m in messages:
-                if isinstance(m, dict) and isinstance(m.get("content"), str):
-                    for match in re.finditer(r'<boltAction\s+type="file"\s+filePath="([^"]+)">\s*(.*?)\s*</boltAction>', m["content"], re.DOTALL):
-                        extracted_files[match.group(1)] = match.group(2)
+            session_id = body.get("session_id") or _chat_session_id(messages)
+            extracted_files = original_files
             if extracted_files:
                 rep = guard_engine.inspect_turn(session_id, extracted_files, advance_turn=True)
                 stale_memories = rep.stale_count if hasattr(rep, 'stale_count') else len(rep.mutated_symbols)
