@@ -5,10 +5,18 @@ import os
 import time
 import traceback
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from fastapi import Request
 from openai import AsyncOpenAI
+
+from gateway.tool_choice import (
+    MAX_ENFORCEMENT_ATTEMPTS,
+    apply_tool_choice_policy,
+    kwargs_for_attempt,
+    recover_tool_calls,
+    strip_private,
+)
 
 # Load environment variables
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -73,6 +81,12 @@ def is_auxiliary_request(payload: dict) -> bool:
     if not messages:
         return False
 
+    # bolt.diy's summary / context-selection / enhancer calls never send tools, while every
+    # agent coding step does. The main system prompt also embeds a "CHAT SUMMARY:" section,
+    # which used to misclassify real coding steps as auxiliary (skipping triage and pruning).
+    if payload.get("tools"):
+        return False
+
     auxiliary_patterns = [
         "prompt engineer",
         "enhance prompt",
@@ -89,6 +103,13 @@ def is_auxiliary_request(payload: dict) -> bool:
         "chat summary",
         "conversation title",
         "suggest a title",
+        # Exact bolt.diy auxiliary system prompts (app/lib/.server/llm/create-summary.ts,
+        # select-context.ts, app/routes/api.enhancer.ts)
+        "summarize the work till now",
+        "updatecontextbuffer",
+        "current context buffer",
+        "professional prompt engineer",
+        "senior software principal architect",
     ]
 
     for msg in messages:
@@ -100,7 +121,9 @@ def is_auxiliary_request(payload: dict) -> bool:
                 if isinstance(part, dict) and "text" in part
             )
         if isinstance(content, str):
-            lower_content = content.lower()
+            # Auxiliary system prompts state their job up front; only the opening counts, so
+            # sections deep inside the main coding prompt cannot trigger a match.
+            lower_content = content.lower()[:800] if msg.get("role") == "system" else content.lower()
             if any(pattern in lower_content for pattern in auxiliary_patterns):
                 return True
 
@@ -144,7 +167,15 @@ async def stream_chat_completion(
     client: Optional[AsyncOpenAI] = None,
     is_auxiliary: Optional[bool] = None,
     telemetry_header: Optional[str] = None,
+    provider: str = "meta",
+    fallback: Optional[Tuple[AsyncOpenAI, str, str]] = None,
+    extra_banner: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
+    """Proxy one chat completion as SSE.
+
+    ``fallback`` = (client, model, provider) used for the final attempt when a required tool call
+    is still missing, e.g. escalating from the Baseten open-weights tier to Muse Spark 1.3.
+    """
     req_id = f"chatcmpl-mgx-{int(time.time() * 1000)}"
 
     if not target_model:
@@ -160,34 +191,77 @@ async def stream_chat_completion(
     if is_auxiliary is None:
         is_auxiliary = is_auxiliary_request(payload)
 
-    emitted_telemetry = False
+    messages = payload.get("messages", [])
+    has_tools = bool(payload.get("tools"))
+    emitted_role = False
+    stats: Dict[str, Any] = {"finish": None, "usage": None, "args": {}, "names": {}}
 
-    # 1. Emit telemetry chunk only for primary user coding requests
-    if not is_auxiliary:
+    def to_dict(chunk: Any) -> Dict[str, Any]:
+        if hasattr(chunk, "model_dump"):
+            return chunk.model_dump(exclude_none=True)
+        if isinstance(chunk, dict):
+            return dict(chunk)
+        return json.loads(str(chunk))
+
+    def render(chunk_dict: Dict[str, Any]) -> Optional[str]:
+        """Normalize one chunk (stable id, exactly one role delta) and serialize it, or drop no-ops."""
+        nonlocal emitted_role
+        chunk_dict["id"] = req_id
+        _track(stats, chunk_dict)
+        choices = chunk_dict.get("choices") or []
+        chunk_dict["choices"] = choices
+        for choice in choices:
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            if "role" in delta:
+                if emitted_role:
+                    delta.pop("role", None)
+                else:
+                    delta["role"] = str(delta["role"]).strip() or "assistant"
+            elif not emitted_role:
+                delta["role"] = "assistant"
+        if choices:
+            c0 = choices[0]
+            if not c0.get("delta") and c0.get("finish_reason") is None and not chunk_dict.get("usage"):
+                return None
+            if any("role" in (c.get("delta") or {}) for c in choices):
+                emitted_role = True
+        return f"data: {json.dumps(chunk_dict)}\n\n"
+
+    def synthetic(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "id": req_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": target_model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+
+    # 1. Telemetry banner. Plain-text requests always get it; agent (tool) requests only on the
+    #    first step of a user turn, so it shows once per prompt instead of once per tool step.
+    #    Text next to a tool call is valid for the AI SDK; only a step with NO matching tool call
+    #    violates a required tool_choice, and that is enforced below.
+    show_banner = not is_auxiliary and (not has_tools or _is_first_agent_step(messages))
+    if show_banner:
         if telemetry_header is None:
             telemetry_header = get_default_telemetry_banner(target_model=target_model)
-
         if telemetry_header:
-            first_chunk = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": target_model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": telemetry_header},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(first_chunk)}\n\n"
-            emitted_telemetry = True
+            out = render(synthetic({"role": "assistant", "content": telemetry_header}))
+            if out:
+                yield out
+    elif extra_banner and not is_auxiliary:
+        out = render(synthetic({"role": "assistant", "content": extra_banner}))
+        if out:
+            yield out
+    elif telemetry_header:
+        clean_comment = telemetry_header.strip().replace("\n", " ")
+        yield f": telemetry: {clean_comment}\n\n"
 
-    # 2. Open upstream stream
+    # 2. Upstream request. Meta accepts only tool_choice="auto"; see gateway/tool_choice.py.
     create_kwargs: Dict[str, Any] = {
         "model": target_model,
-        "messages": payload.get("messages", []),
+        "messages": messages,
         "stream": True,
         "stream_options": {"include_usage": True},
         "temperature": payload.get("temperature", 0.2),
@@ -196,83 +270,156 @@ async def stream_chat_completion(
     for key in ["tools", "tool_choice", "response_format", "stop", "top_p", "presence_penalty", "frequency_penalty"]:
         if key in payload and payload[key] is not None:
             create_kwargs[key] = payload[key]
+    base_kwargs = dict(create_kwargs)
+    enforcement = apply_tool_choice_policy(create_kwargs, provider)
 
     upstream = None
-    is_first_upstream_chunk = True
     try:
-        upstream = await client.chat.completions.create(**create_kwargs)
+        if enforcement is None:
+            upstream = await client.chat.completions.create(**strip_private(create_kwargs))
+            async for chunk in upstream:
+                if request is not None and await request.is_disconnected():
+                    break
+                out = render(to_dict(chunk))
+                if out:
+                    yield out
+        else:
+            for attempt in range(MAX_ENFORCEMENT_ATTEMPTS):
+                attempt_client = client
+                if fallback is not None and attempt == MAX_ENFORCEMENT_ATTEMPTS - 1:
+                    attempt_client, fb_model, fb_provider = fallback
+                    fb_kwargs = dict(base_kwargs, model=fb_model)
+                    fb_enf = apply_tool_choice_policy(fb_kwargs, fb_provider) or enforcement
+                    attempt_kwargs = kwargs_for_attempt(fb_kwargs, fb_enf, attempt)
+                    logger.warning(f"Escalating to {fb_provider}/{fb_model} for the final tool-call attempt")
+                else:
+                    attempt_kwargs = kwargs_for_attempt(create_kwargs, enforcement, attempt)
+                upstream = await attempt_client.chat.completions.create(**attempt_kwargs)
+                buffered: List[Dict[str, Any]] = []
+                text_parts: List[str] = []
+                satisfied = False
+                disconnected = False
+                try:
+                    async for chunk in upstream:
+                        if request is not None and await request.is_disconnected():
+                            disconnected = True
+                            break
+                        cd = to_dict(chunk)
+                        if satisfied:
+                            out = render(cd)
+                            if out:
+                                yield out
+                            continue
+                        for choice in cd.get("choices") or []:
+                            delta = choice.get("delta") or {}
+                            text_parts.append(delta.get("content") or "")
+                            for tc in delta.get("tool_calls") or []:
+                                if enforcement.satisfied_by((tc.get("function") or {}).get("name")):
+                                    satisfied = True
+                        buffered.append(cd)
+                        if satisfied:
+                            # Tool call confirmed: release held text and stream the rest live.
+                            for held in buffered:
+                                out = render(held)
+                                if out:
+                                    yield out
+                            buffered = []
+                finally:
+                    await _close(upstream)
+                    upstream = None
 
-        async for chunk in upstream:
-            # Check client disconnect
-            if request is not None and await request.is_disconnected():
-                break
+                if satisfied or disconnected:
+                    break
 
-            if hasattr(chunk, "model_dump"):
-                chunk_dict = chunk.model_dump(exclude_none=True)
-            elif isinstance(chunk, dict):
-                chunk_dict = dict(chunk)
-            else:
-                chunk_dict = json.loads(str(chunk))
+                recovered = recover_tool_calls("".join(text_parts), attempt_kwargs.get("tools"), enforcement)
+                if recovered:
+                    logger.info(f"Recovered {len(recovered)} tool call(s) printed as text (attempt {attempt + 1})")
+                    deltas = [dict(call, index=i) for i, call in enumerate(recovered)]
+                    for piece in (synthetic({"tool_calls": deltas}), synthetic({}, finish_reason="tool_calls")):
+                        out = render(piece)
+                        if out:
+                            yield out
+                    for held in buffered:
+                        if held.get("usage") and not held.get("choices"):
+                            out = render(held)
+                            if out:
+                                yield out
+                    break
 
-            # Maintain stable request ID across stream
-            chunk_dict["id"] = req_id
+                if attempt + 1 < MAX_ENFORCEMENT_ATTEMPTS:
+                    logger.warning(
+                        f"{attempt_kwargs.get('model')} returned no {enforcement.kind} tool call "
+                        f"({enforcement.tool_name or 'any'}); retry {attempt + 2}/{MAX_ENFORCEMENT_ATTEMPTS}. "
+                        f"Text was: {''.join(text_parts)[:200]!r}"
+                    )
+                    continue
 
-            if "choices" not in chunk_dict or chunk_dict["choices"] is None:
-                chunk_dict["choices"] = []
-
-            # Normalize choices and enforce role invariant
-            skip_chunk = False
-            if chunk_dict["choices"]:
-                for choice in chunk_dict["choices"]:
-                    delta = choice.get("delta")
-                    if isinstance(delta, dict):
-                        if "role" in delta:
-                            if emitted_telemetry:
-                                # Strip duplicate role if telemetry banner was already emitted
-                                delta.pop("role", None)
-                            elif isinstance(delta["role"], str):
-                                # Ensure strictly no leading or trailing spaces
-                                delta["role"] = delta["role"].strip()
-                        elif is_first_upstream_chunk and not emitted_telemetry:
-                            # Ensure first chunk role invariant
-                            delta["role"] = "assistant"
-
-                # If popping duplicate role left delta completely empty without finish_reason, skip no-op chunk
-                choice_0 = chunk_dict["choices"][0]
-                delta_0 = choice_0.get("delta", {})
-                if not delta_0 and choice_0.get("finish_reason") is None and not chunk_dict.get("usage"):
-                    skip_chunk = True
-
-            is_first_upstream_chunk = False
-            if not skip_chunk:
-                yield f"data: {json.dumps(chunk_dict)}\n\n"
+                logger.error("Upstream never produced the required tool call; passing response through")
+                for held in buffered:
+                    out = render(held)
+                    if out:
+                        yield out
 
     except Exception as e:
         logger.error(f"Error in stream_chat_completion: {e}\n{traceback.format_exc()}")
-        error_chunk = {
-            "id": req_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": target_model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "content": f"\n\n> ❌ **Musegix Gateway Error**: {type(e).__name__} - {str(e)}"
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-        yield f"data: {json.dumps(error_chunk)}\n\n"
+        error_delta = {"content": f"\n\n> ❌ **Musegix Gateway Error**: {type(e).__name__} - {str(e)}"}
+        out = render(synthetic(error_delta, finish_reason="stop"))
+        if out:
+            yield out
 
     finally:
-        if upstream is not None and hasattr(upstream, "close"):
-            try:
-                res = upstream.close()
-                if inspect.isawaitable(res):
-                    await res
-            except Exception:
-                pass
+        await _close(upstream)
+        _log_stats(target_model, payload, stats)
 
     yield "data: [DONE]\n\n"
+
+
+def _track(stats: Dict[str, Any], chunk_dict: Dict[str, Any]) -> None:
+    if chunk_dict.get("usage"):
+        stats["usage"] = chunk_dict["usage"]
+    for choice in chunk_dict.get("choices") or []:
+        if choice.get("finish_reason"):
+            stats["finish"] = choice["finish_reason"]
+        for tc in (choice.get("delta") or {}).get("tool_calls") or []:
+            i = tc.get("index", 0)
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                stats["names"][i] = fn["name"]
+            stats["args"][i] = stats["args"].get(i, "") + (fn.get("arguments") or "")
+
+
+def _log_stats(model: str, payload: Dict[str, Any], stats: Dict[str, Any]) -> None:
+    """One line per request: lets you see truncated tool arguments or missing tool calls at a glance."""
+    calls = []
+    for i, name in stats["names"].items():
+        raw = stats["args"].get(i, "")
+        try:
+            json.loads(raw or "{}")
+            calls.append(f"{name}:ok")
+        except ValueError:
+            calls.append(f"{name}:UNPARSEABLE({len(raw)} chars)")
+    usage = stats["usage"] or {}
+    logger.info(
+        f"[stream] model={model} max_tokens={payload.get('max_tokens')} "
+        f"tool_choice={str(payload.get('tool_choice'))[:60]} finish={stats['finish']} "
+        f"completion_tokens={usage.get('completion_tokens')} tool_calls={calls}"
+    )
+
+
+def _is_first_agent_step(messages: List[Dict[str, Any]]) -> bool:
+    """True when the latest non-system message is the user's prompt (no tool results yet this turn)."""
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") == "system":
+            continue
+        return msg.get("role") == "user"
+    return False
+
+
+async def _close(upstream: Any) -> None:
+    if upstream is not None and hasattr(upstream, "close"):
+        try:
+            res = upstream.close()
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
+            pass

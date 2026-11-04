@@ -13,6 +13,7 @@ Invariants:
 from __future__ import annotations
 
 import ast
+import math
 from dataclasses import dataclass, field
 import os
 import re
@@ -290,6 +291,54 @@ def _extract_signatures_regex_fallback(code: str) -> str:
     return "\n".join(preserved_lines)
 
 
+BM25_TOP_K = 2
+_BUILD_DIR_RE = re.compile(r"(^|/)(dist|build|out|\.next|\.nuxt|\.output|coverage|node_modules)/", re.IGNORECASE)
+_BUILD_FILE_RE = re.compile(r"(\.min\.(js|css)|\.map|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$", re.IGNORECASE)
+_STOPWORDS = set(
+    "the a an to of and in on for with from by at as is are be it this that make change set update "
+    "add please can you we i me my our into new use using".split()
+)
+
+
+def is_build_artifact(file_path: str, body: str) -> bool:
+    """Generated files: build output dirs, minified bundles, source maps, lockfiles."""
+    norm = file_path.replace("\\", "/")
+    if _BUILD_DIR_RE.search(norm) or _BUILD_FILE_RE.search(norm):
+        return True
+    # Minified code: any single line longer than 2,000 characters
+    return any(len(line) > 2000 for line in body.splitlines())
+
+
+def _terms(text: str) -> List[str]:
+    words = re.findall(r"[a-z][a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", text).lower())
+    return [w for w in words if w not in _STOPWORDS and len(w) > 2]
+
+
+def bm25_rank_files(prompt: str, files: Dict[str, str], top_k: int = BM25_TOP_K,
+                    k1: float = 1.2, b: float = 0.75) -> List[str]:
+    """Top-k file paths by Okapi BM25 between the prompt and each file's path + body."""
+    query = list(dict.fromkeys(_terms(prompt)))
+    if not query or not files:
+        return []
+    docs = {p: _terms(p + " " + body) for p, body in files.items()}
+    n_docs = len(docs)
+    avg_len = sum(len(d) for d in docs.values()) / max(1, n_docs)
+    df = {t: sum(1 for d in docs.values() if t in d) for t in query}
+    scores = []
+    for path, doc in docs.items():
+        score = 0.0
+        for t in query:
+            tf = doc.count(t)
+            if not tf:
+                continue
+            idf = math.log(1 + (n_docs - df[t] + 0.5) / (df[t] + 0.5))
+            score += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * len(doc) / max(1e-9, avg_len)))
+        if score > 0:
+            scores.append((score, path))
+    scores.sort(reverse=True)
+    return [p for _, p in scores[:top_k]]
+
+
 class PolyFabricPruner:
     """Safe context pruner adhering strictly to the Target File Invariant."""
 
@@ -397,6 +446,18 @@ class PolyFabricPruner:
             for d in detected:
                 resolved_targets.add(d)
 
+        # Users rarely name files ("make the title orange"), so fall back to BM25 relevance
+        # between the prompt and each source file. Build artifacts never compete.
+        if not resolved_targets and user_prompt:
+            bodies = {}
+            for m in all_blocks:
+                path_m = re.search(r'filePath=["\']([^"\']+)["\']', m.group(2))
+                if path_m:
+                    bodies[path_m.group(1).strip()] = m.group(3)
+            source = {p: b for p, b in bodies.items() if not is_build_artifact(p, b)}
+            for d in bm25_rank_files(user_prompt, source, top_k=BM25_TOP_K):
+                resolved_targets.add(d)
+
         # Helper to check if a file_path matches any resolved target
         def is_target(fp: str) -> bool:
             norm_fp = fp.replace("\\", "/").strip()
@@ -431,7 +492,13 @@ class PolyFabricPruner:
 
             if type_m and type_m.group(1).lower() == "file" and path_m:
                 file_path = path_m.group(1).strip()
-                if is_target(file_path) or not resolved_targets:
+                if is_build_artifact(file_path, body) and file_path not in resolved_targets:
+                    # Generated output (dist/, minified bundles, lockfiles): never useful to the model
+                    stub = (f"// [PolyFabric: build artifact omitted ({count_tokens(body)} tokens). "
+                            f"Use project_read_file if it is really needed.]")
+                    output_parts.append(open_tag + "\n" + stub + "\n" + close_tag)
+                    pruned_files.append(file_path)
+                elif is_target(file_path) or not resolved_targets:
                     # TARGET FILE INVARIANT: 100% UNTOUCHED
                     output_parts.append(open_tag + body + close_tag)
                     preserved_files.append(file_path)

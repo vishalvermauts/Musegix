@@ -4,6 +4,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -14,6 +15,14 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from gateway.engines.ysolveth_classifier import YsolvethClassifier
 from gateway.engines.polyfabric_pruner import PolyFabricPruner, count_tokens
 from gateway.engines.veylqora_guard import VeylqoraGuard
+from gateway.prompt_extract import latest_user_prompt
+from gateway.tool_choice import (
+    MAX_ENFORCEMENT_ATTEMPTS,
+    apply_tool_choice_policy,
+    kwargs_for_attempt,
+    recover_tool_calls,
+    strip_private,
+)
 from gateway.streaming import (
     stream_chat_completion,
     get_upstream_client,
@@ -49,6 +58,35 @@ def get_guard() -> VeylqoraGuard:
     if _guard is None:
         _guard = VeylqoraGuard()
     return _guard
+
+
+_DUMP_DIR = Path(__file__).resolve().parent.parent / "data" / "requests"
+_PRUNE_REPORTED: dict = {}
+
+
+def _debug_dump(body: dict, classified_text: str) -> None:
+    """Set MUSEGIX_DUMP_REQUESTS=1 to save every incoming request (secrets never appear in bodies)."""
+    if os.getenv("MUSEGIX_DUMP_REQUESTS") != "1":
+        return
+    _DUMP_DIR.mkdir(parents=True, exist_ok=True)
+    name = f"{int(time.time() * 1000)}.json"
+    roles = [m.get("role") for m in body.get("messages", []) if isinstance(m, dict)]
+    (_DUMP_DIR / name).write_text(json.dumps(body, indent=1, ensure_ascii=False), encoding="utf-8")
+    logger.info(
+        f"[dump] {name} roles={roles} tools={len(body.get('tools') or [])} "
+        f"classified_text({len(classified_text)} chars)={classified_text[:300]!r}"
+    )
+
+
+def _tool_call_fallback(provider: str):
+    """Escalation target when the routed model keeps skipping a required tool call.
+
+    The Baseten open-weights tier is cheapest but less reliable on long agent contexts;
+    Muse Spark 1.3 on Meta passed 10/10 forced-tool probes, so it is the fallback.
+    """
+    if provider == "baseten" and os.getenv("META_API_KEY"):
+        return (get_upstream_client(provider="meta"), "muse-spark-1.3", "meta")
+    return None
 
 
 @router.get("/models")
@@ -97,17 +135,11 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="Missing 'messages' in request body")
 
     # 1. Extract latest user prompt
-    user_prompt = ""
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            c = msg.get("content", "")
-            if isinstance(c, list):
-                user_prompt = " ".join(
-                    p.get("text", "") for p in c if isinstance(p, dict) and "text" in p
-                )
-            elif isinstance(c, str):
-                user_prompt = c
-            break
+    # bolt.diy wraps typed prompts in "[Model: ...]\n\n[Provider: ...]\n\n"; that wrapper
+    # flipped Ysolveth's tier on 5/20 prompts (scripts/ysolveth_wrapper_check.py), so strip it.
+    user_prompt = latest_user_prompt(messages)
+
+    _debug_dump(body, user_prompt)
 
     is_aux = is_auxiliary_request(body)
     model_param = body.get("model")
@@ -117,8 +149,11 @@ async def chat_completions(request: Request):
     provider = "meta"
     triage_ms = None
 
-    # 2. Ysolveth System One Triage
-    if not model_param or model_param == "musecontext-auto":
+    # 2. Ysolveth System One Triage (only for the user's coding prompt; bolt.diy's summary /
+    #    context-selection / enhancer calls carry templates, not a task, so they keep the default)
+    if is_aux and (not model_param or model_param == "musecontext-auto"):
+        pass
+    elif not model_param or model_param == "musecontext-auto":
         try:
             clf = get_classifier()
             triage_res = clf.classify(user_prompt or "code generation")
@@ -126,6 +161,15 @@ async def chat_completions(request: Request):
             target_model = triage_res["target_model"]
             provider = triage_res["provider"]
             triage_ms = triage_res["latency_ms"]
+
+            # Multi-file or full application requests require advanced reasoning (Meta Muse Spark/Wonder)
+            # over the open-weight lightweight tier
+            lower_prompt = user_prompt.lower()
+            scaffold_keywords = ["portfolio", "website", "fullstack", "dashboard", "showcase", "application", "multi-file"]
+            if tier == "TRIVIAL" and any(k in lower_prompt for k in scaffold_keywords):
+                tier = "MODERATE"
+                target_model = "muse-spark-1.3"
+                provider = "meta"
         except Exception as e:
             logger.warning(f"Ysolveth triage fallback: {e}")
             tier = "MODERATE"
@@ -155,7 +199,8 @@ async def chat_completions(request: Request):
     if not is_aux:
         # Check if there is bolt multi-file context to prune
         for msg in messages:
-            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            # System prompts hold bolt.diy's <boltAction> *examples*; never rewrite instructions.
+            if isinstance(msg, dict) and msg.get("role") != "system" and isinstance(msg.get("content"), str):
                 content = msg["content"]
                 if "<boltArtifact" in content or '<boltAction type="file"' in content:
                     try:
@@ -164,8 +209,13 @@ async def chat_completions(request: Request):
                             context_text=content,
                             user_prompt=user_prompt
                         )
-                        selected_tokens = prune_res.pruned_tokens
-                        raw_tokens = prune_res.raw_tokens
+                        selected_tokens = (selected_tokens or 0) + prune_res.pruned_tokens
+                        raw_tokens = (raw_tokens or 0) + prune_res.raw_tokens
+                        logger.info(
+                            f"[polyfabric] {prune_res.raw_tokens} -> {prune_res.pruned_tokens} tokens "
+                            f"kept={prune_res.preserved_files} pruned={len(prune_res.pruned_files)} files "
+                            f"({prune_res.elapsed_ms}ms)"
+                        )
                         msg["content"] = prune_res.pruned_text
                     except Exception as e:
                         logger.warning(f"PolyFabric pruning exception: {e}")
@@ -191,6 +241,7 @@ async def chat_completions(request: Request):
 
     # 4. Telemetry Header Construction
     telemetry_header = None
+    extra_banner = None
     if not is_aux:
         telemetry_header = get_default_telemetry_banner(
             tier=tier,
@@ -200,9 +251,24 @@ async def chat_completions(request: Request):
             raw_tokens=raw_tokens,
             stale_memories=stale_memories,
         )
+        # bolt.diy attaches the project snapshot only from the 2nd agent step on, after the
+        # first-step banner has gone out. Report the first real pruning of each prompt once.
+        if raw_tokens and selected_tokens is not None and raw_tokens > selected_tokens:
+            turn_key = f"{body.get('session_id', '')}|{len(messages and [m for m in messages if m.get('role') == 'user'])}|{user_prompt}"
+            if turn_key not in _PRUNE_REPORTED:
+                _PRUNE_REPORTED[turn_key] = True
+                if len(_PRUNE_REPORTED) > 500:
+                    _PRUNE_REPORTED.pop(next(iter(_PRUNE_REPORTED)))
+                pct = (raw_tokens - selected_tokens) / raw_tokens * 100
+                extra_banner = (
+                    f"> 🔍 **PolyFabric AST**: `{selected_tokens}` tokens vs `{raw_tokens}` raw "
+                    f"({pct:.1f}% pruned)\n\n"
+                )
 
     client = get_upstream_client(provider=provider)
-    stream = body.get("stream", True)
+    # OpenAI spec: an absent "stream" means a non-streaming JSON response. bolt.diy's
+    # generateText calls (chat summary, context selection) omit it and fail on SSE.
+    stream = bool(body.get("stream", False))
 
     if stream:
         return StreamingResponse(
@@ -213,6 +279,9 @@ async def chat_completions(request: Request):
                 client=client,
                 is_auxiliary=is_aux,
                 telemetry_header=telemetry_header,
+                provider=provider,
+                fallback=_tool_call_fallback(provider),
+                extra_banner=extra_banner,
             ),
             media_type="text/event-stream",
             headers={
@@ -238,21 +307,41 @@ async def chat_completions(request: Request):
             if key in body and body[key] is not None:
                 create_kwargs[key] = body[key]
 
+        # Meta API only supports tool_choice="auto"; emulate required/named choices (gateway/tool_choice.py)
+        enforcement = apply_tool_choice_policy(create_kwargs, provider)
+
         try:
-            resp = await client.chat.completions.create(**create_kwargs)
-            if hasattr(resp, "model_dump"):
-                resp_dict = resp.model_dump()
-            elif isinstance(resp, dict):
-                resp_dict = dict(resp)
-            else:
-                resp_dict = json.loads(str(resp))
+            attempts = MAX_ENFORCEMENT_ATTEMPTS if enforcement else 1
+            for attempt in range(attempts):
+                kw = kwargs_for_attempt(create_kwargs, enforcement, attempt) if enforcement else strip_private(create_kwargs)
+                resp = await client.chat.completions.create(**kw)
+                if hasattr(resp, "model_dump"):
+                    resp_dict = resp.model_dump()
+                elif isinstance(resp, dict):
+                    resp_dict = dict(resp)
+                else:
+                    resp_dict = json.loads(str(resp))
+                if enforcement is None or not resp_dict.get("choices"):
+                    break
+                choice0 = resp_dict["choices"][0]
+                msg0 = choice0.get("message") or {}
+                names = [((tc or {}).get("function") or {}).get("name") for tc in msg0.get("tool_calls") or []]
+                if any(enforcement.satisfied_by(n) for n in names):
+                    break
+                recovered = recover_tool_calls(msg0.get("content") or "", kw.get("tools"), enforcement)
+                if recovered:
+                    msg0["tool_calls"] = recovered
+                    msg0["content"] = None
+                    choice0["finish_reason"] = "tool_calls"
+                    break
+                logger.warning(f"Non-streaming: no required tool call (attempt {attempt + 1}/{attempts})")
 
             # Ensure choices and message content invariants for Vercel AI SDK
             if "choices" in resp_dict and resp_dict["choices"]:
                 for choice in resp_dict["choices"]:
                     msg = choice.get("message")
                     if isinstance(msg, dict):
-                        if msg.get("content") is None:
+                        if msg.get("content") is None and not msg.get("tool_calls"):
                             # If model only returned reasoning or empty content, extract reasoning or default
                             msg["content"] = msg.get("reasoning_content") or "Ready"
             return JSONResponse(resp_dict)
