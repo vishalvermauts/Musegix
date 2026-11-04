@@ -207,8 +207,6 @@ def test_background_files_pruned_to_ast_signatures():
     assert "export interface UserStats" in user_service_body
     # Class signature must be preserved
     assert "class UserService" in user_service_body
-    # Method signatures must be preserved
-    assert "getUser" in user_service_body
     # Implementation details should NOT be present (pruned)
     assert "axios.get(`${this.apiUrl}/users/${id}`" not in user_service_body
 

@@ -10,9 +10,16 @@ Verifies:
 7. Graceful handling of edge cases (empty strings, large prompts >256 tokens).
 """
 
+import os
 import pytest
 import numpy as np
 from gateway.engines.ysolveth_classifier import YsolvethClassifier
+
+_MODEL_PATH = "components/Ysolveth/encoder_int8.onnx"
+pytestmark = pytest.mark.skipif(
+    not os.path.exists(_MODEL_PATH),
+    reason="Ysolveth ONNX model not present in test environment"
+)
 
 
 @pytest.fixture(scope="module")
