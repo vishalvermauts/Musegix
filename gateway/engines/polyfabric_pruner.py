@@ -263,7 +263,7 @@ def _extract_signatures_regex_fallback(code: str) -> str:
     ]
     for line in lines:
         stripped = line.strip()
-        # Keep imports, interfaces, types, exports, function headers, class headers
+        # Keep imports, interfaces, types, exports, function headers, class headers, methods
         if (
             stripped.startswith("import ")
             or stripped.startswith("from ")
@@ -277,6 +277,7 @@ def _extract_signatures_regex_fallback(code: str) -> str:
             or stripped.startswith("def ")
             or stripped.startswith("class ")
             or stripped.startswith("@")
+            or (re.match(r"^\s*(public\s+|private\s+|protected\s+|async\s+)?\w+\s*\(.*\)", stripped) and "{" in stripped)
         ):
             # If line opens a block, replace block body with stub
             if "{" in line and not stripped.startswith("import"):
