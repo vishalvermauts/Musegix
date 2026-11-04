@@ -45,6 +45,9 @@ cmake-build-*/
 *.sqlite3
 *.sqlite-wal
 *.sqlite-shm
+data/*.db
+data/*.db-wal
+data/*.db-shm
 
 # IDE & OS Artifacts
 .DS_Store

@@ -1,3 +1,9 @@
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Ensure .env is loaded before anything else
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from gateway.routes import router

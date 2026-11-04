@@ -1,19 +1,33 @@
 import inspect
 import json
+import logging
 import os
 import time
+import traceback
+from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Optional
+from dotenv import load_dotenv
 from fastapi import Request
 from openai import AsyncOpenAI
 
-_upstream_client: Optional[AsyncOpenAI] = None
+# Load environment variables
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+logger = logging.getLogger("gateway.streaming")
+
+_clients: Dict[str, AsyncOpenAI] = {}
+_custom_client: Optional[AsyncOpenAI] = None
 
 
-def get_upstream_client(provider: str = "baseten") -> AsyncOpenAI:
+def get_upstream_client(provider: str = "meta") -> AsyncOpenAI:
     """Return the appropriate client based on provider and available keys."""
-    global _upstream_client
-    if _upstream_client is not None:
-        return _upstream_client
+    global _custom_client
+    if _custom_client is not None:
+        return _custom_client
+
+    provider = (provider or "meta").lower()
+    if provider in _clients:
+        return _clients[provider]
 
     meta_key = os.getenv("META_API_KEY")
     baseten_key = os.getenv("BASETEN_API_KEY")
@@ -21,21 +35,29 @@ def get_upstream_client(provider: str = "baseten") -> AsyncOpenAI:
 
     if provider == "meta" and meta_key:
         base_url = os.getenv("META_BASE_URL", "https://api.meta.ai/v1")
-        return AsyncOpenAI(api_key=meta_key, base_url=base_url)
+        client = AsyncOpenAI(api_key=meta_key, base_url=base_url)
+    elif provider == "baseten" and baseten_key:
+        base_url = os.getenv("BASETEN_BASE_URL", "https://inference.baseten.co/v1")
+        client = AsyncOpenAI(api_key=baseten_key, base_url=base_url)
+    elif meta_key:
+        base_url = os.getenv("META_BASE_URL", "https://api.meta.ai/v1")
+        client = AsyncOpenAI(api_key=meta_key, base_url=base_url)
     elif baseten_key:
         base_url = os.getenv("BASETEN_BASE_URL", "https://inference.baseten.co/v1")
-        return AsyncOpenAI(api_key=baseten_key, base_url=base_url)
+        client = AsyncOpenAI(api_key=baseten_key, base_url=base_url)
     elif openai_key:
         base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        return AsyncOpenAI(api_key=openai_key, base_url=base_url)
+        client = AsyncOpenAI(api_key=openai_key, base_url=base_url)
     else:
-        # Fallback dummy for offline testing
-        return AsyncOpenAI(api_key="sk-dummy-key", base_url=None)
+        client = AsyncOpenAI(api_key="sk-dummy-key", base_url=None)
+
+    _clients[provider] = client
+    return client
 
 
 def set_upstream_client(client: Optional[AsyncOpenAI]) -> None:
-    global _upstream_client
-    _upstream_client = client
+    global _custom_client
+    _custom_client = client
 
 
 def is_auxiliary_request(payload: dict) -> bool:
@@ -195,9 +217,12 @@ async def stream_chat_completion(
             # Maintain stable request ID across stream
             chunk_dict["id"] = req_id
 
+            if "choices" not in chunk_dict or chunk_dict["choices"] is None:
+                chunk_dict["choices"] = []
+
             # Normalize choices and enforce role invariant
             skip_chunk = False
-            if "choices" in chunk_dict and chunk_dict["choices"]:
+            if chunk_dict["choices"]:
                 for choice in chunk_dict["choices"]:
                     delta = choice.get("delta")
                     if isinstance(delta, dict):
@@ -223,6 +248,7 @@ async def stream_chat_completion(
                 yield f"data: {json.dumps(chunk_dict)}\n\n"
 
     except Exception as e:
+        logger.error(f"Error in stream_chat_completion: {e}\n{traceback.format_exc()}")
         error_chunk = {
             "id": req_id,
             "object": "chat.completion.chunk",
