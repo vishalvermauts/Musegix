@@ -9,13 +9,28 @@ from openai import AsyncOpenAI
 _upstream_client: Optional[AsyncOpenAI] = None
 
 
-def get_upstream_client() -> AsyncOpenAI:
+def get_upstream_client(provider: str = "baseten") -> AsyncOpenAI:
+    """Return the appropriate client based on provider and available keys."""
     global _upstream_client
-    if _upstream_client is None:
-        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MUSEGIX_API_KEY") or "sk-dummy-key"
-        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("MUSEGIX_UPSTREAM_BASE_URL") or None
-        _upstream_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-    return _upstream_client
+    if _upstream_client is not None:
+        return _upstream_client
+
+    meta_key = os.getenv("META_API_KEY")
+    baseten_key = os.getenv("BASETEN_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+
+    if provider == "meta" and meta_key:
+        base_url = os.getenv("META_BASE_URL", "https://api.meta.ai/v1")
+        return AsyncOpenAI(api_key=meta_key, base_url=base_url)
+    elif baseten_key:
+        base_url = os.getenv("BASETEN_BASE_URL", "https://inference.baseten.co/v1")
+        return AsyncOpenAI(api_key=baseten_key, base_url=base_url)
+    elif openai_key:
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        return AsyncOpenAI(api_key=openai_key, base_url=base_url)
+    else:
+        # Fallback dummy for offline testing
+        return AsyncOpenAI(api_key="sk-dummy-key", base_url=None)
 
 
 def set_upstream_client(client: Optional[AsyncOpenAI]) -> None:
