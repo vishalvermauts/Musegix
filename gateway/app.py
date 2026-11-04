@@ -25,3 +25,4 @@ async def root():
         "status": "ok",
         "version": "1.0.0"
     }
+

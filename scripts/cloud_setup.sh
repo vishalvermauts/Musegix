@@ -21,3 +21,4 @@ if [ -f "requirements.txt" ]; then
 fi
 
 echo "==> Cloud Environment successfully provisioned."
+
