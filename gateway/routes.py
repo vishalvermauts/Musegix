@@ -223,12 +223,16 @@ async def chat_completions(request: Request):
         )
     else:
         # Full non-streaming passthrough to upstream client
+        max_tokens_val = body.get("max_tokens", 4096)
+        if max_tokens_val and max_tokens_val < 512:
+            max_tokens_val = 1024
+
         create_kwargs = {
             "model": target_model,
             "messages": messages,
             "stream": False,
             "temperature": body.get("temperature", 0.2),
-            "max_tokens": body.get("max_tokens", 4096),
+            "max_tokens": max_tokens_val,
         }
         for key in ["tools", "tool_choice", "response_format", "stop", "top_p", "presence_penalty", "frequency_penalty"]:
             if key in body and body[key] is not None:
@@ -237,13 +241,23 @@ async def chat_completions(request: Request):
         try:
             resp = await client.chat.completions.create(**create_kwargs)
             if hasattr(resp, "model_dump"):
-                resp_dict = resp.model_dump(exclude_none=True)
+                resp_dict = resp.model_dump()
             elif isinstance(resp, dict):
-                resp_dict = resp
+                resp_dict = dict(resp)
             else:
                 resp_dict = json.loads(str(resp))
+
+            # Ensure choices and message content invariants for Vercel AI SDK
+            if "choices" in resp_dict and resp_dict["choices"]:
+                for choice in resp_dict["choices"]:
+                    msg = choice.get("message")
+                    if isinstance(msg, dict):
+                        if msg.get("content") is None:
+                            # If model only returned reasoning or empty content, extract reasoning or default
+                            msg["content"] = msg.get("reasoning_content") or "Ready"
             return JSONResponse(resp_dict)
         except Exception as e:
+            logger.error(f"Upstream provider error in non-streaming chat: {e}")
             raise HTTPException(
                 status_code=502,
                 detail=f"Upstream provider error: {type(e).__name__} - {str(e)}",
