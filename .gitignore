@@ -1,0 +1,55 @@
+# .gitignore for Musegix
+
+# Environment & Secrets (NEVER COMMIT CREDENTIALS)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Node & Frontend
+node_modules/
+.pnpm-store/
+dist/
+.output/
+.next/
+
+# Large External Repositories (Built inside Docker Sandboxes)
+external/
+bolt.diy/
+PolyFabric_repo/
+Veylqora_repo/
+Ysolveth_repo/
+
+# C++ Build & SQLite Cache
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+build/
+cmake-build-*/
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# IDE & OS Artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -1,0 +1,8 @@
+{
+  "project": "Musegix",
+  "active_branch": "main",
+  "phase": "Phase 1 - Bootstrap & Gateway",
+  "last_updated": "2026-11-04T14:48:00+11:00",
+  "cloud_sandbox": "musegix-builder (8 CPU / 16 GiB)",
+  "remote_repo": "https://github.com/vishalvermauts/Musegix.git"
+}
