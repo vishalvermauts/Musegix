@@ -1,76 +1,126 @@
 # Musegix
 
-> **Intelligent Multi-Model Routing, AST Context Pruning & Staleness-Aware Agent Memory for `bolt.diy`**
+**An orchestration layer for AI app building with Meta's models.**
 
-[![CI Gate](https://github.com/vishalvermauts/Musegix/actions/workflows/ci.yml/badge.svg)](https://github.com/vishalvermauts/Musegix/actions/workflows/ci.yml)
-[![Target Event](https://img.shields.io/badge/Hackathon-Meta_Global_AI_Developer-purple.svg)](https://cerebralvalley.ai/e/meta-ai-developer-hackathon/details)
+Musegix sits between a browser app builder and Meta's models. For every request, it decides which model should answer, what project context to send, and what a change affects, so each step costs fewer tokens and finishes faster.
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Musegix** is an intelligent AI IDE gateway designed to solve the three biggest problems in browser-based AI code generation: **context window bloat**, **stale memory hallucinations**, and **wasteful model over-provisioning**.
-
-It seamlessly integrates with [bolt.diy](https://github.com/stackblitz-labs/bolt.diy) as an OpenAI-compatible SSE proxy, connecting real, verified developer tools:
-- **[Ysolveth](https://github.com/vishalvermauts/Ysolveth):** A real `<5 ms` INT8 ONNX System One complexity classifier running on CPU to route requests between Meta's Muse Spark and Muse Wonder models.
-- **[PolyFabric](https://github.com/vishalvermauts/PolyFabric):** Local Tree-sitter AST symbol indexing and context pruning, saving 85%+ prompt tokens while preserving `bolt.diy`'s `<boltArtifact>` format.
-- **[Veylqora](https://github.com/vishalvermauts/Veylqora):** C++20 SQLite WAL memory engine tracking SHA-256 AST fingerprints to flag stale agent assumptions in real-time.
-
 ---
 
-## Architecture Overview
+## The problem
 
+AI coding agents resend the whole conversation and the project files on every step. Old tool output (file reads, command logs) is sent again even after the agent has used it. Every step costs tokens, money and time, and every edit runs the same expensive model, whether it's a colour change or a multi-file feature.
+
+## The solution
+
+Musegix adds three engines in front of the model. Each request passes through them in order:
+
+| Engine | Job | What it saves or protects |
+|---|---|---|
+| **Ysolveth** | On-device routing. A small classifier runs on the CPU and picks the model for each request. | Cost and speed: simple edits go to a cheaper model, harder work to a stronger one. |
+| **PolyFabric** | Context trimming. Shortens old tool output and sends only the project files a request needs. | Tokens: fewer tokens sent on every step. |
+| **Veylqora** | Impact tracking. Fingerprints every function and component, and lists the files that depend on a changed export. | Fewer surprises: the model is told what else a change affects. |
+
+Each reply shows a status card for the three engines: the model chosen, the tokens trimmed, and the files affected.
+
+```mermaid
+flowchart LR
+    U[User prompt] --> B[Browser app builder<br/>bolt.diy]
+    B -->|OpenAI-compatible request| G[Musegix gateway]
+    G --> Y[Ysolveth<br/>on-device routing]
+    Y --> P[PolyFabric<br/>context trimming]
+    P --> V[Veylqora<br/>impact tracking]
+    V -->|routed, trimmed request| M{Meta models}
+    M -->|muse-spark-1.3 / muse-wonder-1.0| G
+    M -->|Baseten open model for trivial edits| G
+    G -->|streamed reply + status cards| B
 ```
-+---------------------------------------------------------------------------------------+
-|                                    bolt.diy (Browser IDE)                             |
-|         Left: AI Chat        Center: Streaming Editor & Diffs      Right: WebContainer|
-+------------------------------------------+--------------------------------------------+
-                                           | POST /v1/chat/completions (OpenAI SSE)
-                                           v
-+---------------------------------------------------------------------------------------+
-|                               Musegix Gateway (FastAPI SSE Proxy)                     |
-|                                                                                       |
-|  [1. Ysolveth ONNX Classifier]  -->  CPU-bound prompt complexity routing in <5ms      |
-|  [2. Veylqora AST Guard]        -->  Catches mutated code symbols via SQLite WAL      |
-|  [3. PolyFabric AST Pruner]     -->  Prunes raw file dumps into compact AST stubs     |
-|  [4. SSE Telemetry Streamer]    -->  Streams live metrics, code diffs, & HMR updates  |
-+---------------------------------------------------------------------------------------+
+
+---
+
+## Results
+
+Measured on our own test runs. These are not general guarantees.
+
+| Measure | Result | Where it comes from |
+|---|---|---|
+| Old tool output sent to the model | cut by **94%** on a test run (12,103 → 731 tokens) | `data/gateway.log`, `[polyfabric-tools]` |
+| Project-file tokens on a large project | cut by **89.7%** (60,069 → 6,200) on a Kanban edit | earlier run; log not kept in the repo |
+| Ysolveth routing time on CPU | warm p50 **1.8 ms** | `benchmarks/benchmark_results.json` |
+| Ysolveth routing accuracy | **81%** on a 42-prompt held-out set (candidate head v5) | `reports/ysolveth_v5.md` |
+| Veylqora stale-symbol detection | **100%** of mutated background symbols in our test set | `benchmarks/benchmark_results.md` |
+| MBPP+ pass rate by model tier | cheap **83.9%**, mid **90.7%**, strong **87.8%** (378 tasks) | `data/labels/mbpp/full_results.jsonl` |
+
+**Limits**
+- Routing is weaker on hard tasks, so some hard requests go to a cheaper model.
+- Project-file savings depend on project size: small projects save little.
+- Dollar savings are not measured, because model prices are not in this repo.
+- The edit speed-up is not yet proven. Our timing runs did not show a clear gain from the symbol index.
+- Veylqora's memory is stored but not yet fed back to the model.
+
+---
+
+## Certifications
+
+Musegix has no certifications. The tests in `tests/` cover the gateway, tool-call enforcement, prompt extraction, pruning and symbol indexing. Run `python -m pytest -q tests` to check.
+
+---
+
+## Install
+
+### Prerequisites
+- Python 3.11 or newer
+- Node.js with pnpm 9.15.9 or newer (for bolt.diy)
+- A Meta Model API key, and a Baseten key for the open-weights model
+
+### 1. Musegix gateway
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # then fill in META_API_KEY and BASETEN_API_KEY
+python -m uvicorn gateway.app:app --port 8000
+```
+
+The gateway reads `.env` from the repo root.
+
+### 2. bolt.diy (vendored in `vendor/bolt.diy`)
+
+```bash
+cd vendor/bolt.diy
+pnpm install
+pnpm run dev
+```
+
+Open `http://localhost:5173`. In the model selector, choose **Meta AI**. `vendor/bolt.diy/VENDORED.md` lists the upstream commit and the files changed for Musegix.
+
+### 3. Optional: test and benchmark scripts
+
+```bash
+python -m pytest -q tests
 ```
 
 ---
 
-## 5-Phase Master Plan & Certification Gates
+## Repository layout
 
-See our detailed documentation suite in [`plan/`](plan/):
-- [Master Single Source of Truth (SSOT)](plan/00_MASTER_SSOT.md)
-- [Phase 1: Bootstrap, Cloud Sandbox & Gateway](plan/01_PHASE_1_BOOTSTRAP_AND_GATEWAY.md)
-- [Phase 2: Full UI Integration with `bolt.diy`](plan/02_PHASE_2_BOLT_DIY_UI_INTEGRATION.md)
-- [Phase 3: Real Engine Integrations](plan/03_PHASE_3_REAL_ENGINE_INTEGRATIONS.md)
-- [Phase 4: FastMCP Server & Visual Render Gate](plan/04_PHASE_4_MCP_AND_VISION_GATE.md)
-- [Phase 5: Automated Benchmarks & Final Release](plan/05_PHASE_5_BENCHMARKS_AND_RELEASE.md)
-- [Security & Governance Architecture](plan/SECURITY_AND_GOVERNANCE.md)
-- [Errors, Logs & Incident Register](plan/ERRORS_AND_LOGS.md)
+| Path | Contents |
+|---|---|
+| `gateway/` | FastAPI gateway, routing, pruning, symbol index, Veylqora guard |
+| `gateway/engines/` | Ysolveth classifier, PolyFabric pruner, Veylqora guard, symbol index |
+| `components/Ysolveth/` | Ysolveth encoder, tokenizer and classifier head |
+| `vendor/bolt.diy/` | Modified copy of bolt.diy, with its own licence |
+| `benchmarks/`, `reports/`, `docs/` | Benchmark results, training reports, metrics notes |
+| `tests/` | Gateway and engine tests |
 
 ---
 
-## 10-Task Evaluation Benchmark Results
+## Licence
 
-The following table reflects **100% genuine runtime measurements** executed across the full Musegix pipeline (Ysolveth ONNX CPU pass + PolyFabric Tree-sitter pruning + Veylqora SQLite WAL + live Meta and Baseten model APIs). Zero fake constants or mock heuristics.
+Musegix code is licensed under the Apache License 2.0 (see [LICENSE](LICENSE)).
 
-| Task ID | Tier | Expected Model | Ysolveth Predicted Model | Confidence | Ysolveth CPU (ms) | PolyFabric Tokens (Raw -> Pruned) | Reduction % | Veylqora Status | Upstream Status |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `TASK-01` | **Trivial** | `meta-models/muse-spark-open-1026` | `meta-models/muse-spark-open-1026` | `0.94` | `2.00ms` | `613 -> 396` | **-35.4%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Baseten) |
-| `TASK-02` | **Trivial** | `meta-models/muse-spark-open-1026` | `meta-models/muse-spark-open-1026` | `0.97` | `1.79ms` | `610 -> 425` | **-30.3%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Baseten) |
-| `TASK-03` | **Trivial** | `meta-models/muse-spark-open-1026` | `meta-models/muse-spark-open-1026` | `0.95` | `1.55ms` | `499 -> 283` | **-43.3%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Baseten) |
-| `TASK-04` | **Trivial** | `meta-models/muse-spark-open-1026` | `meta-models/muse-spark-open-1026` | `0.92` | `1.76ms` | `527 -> 379` | **-28.1%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Baseten) |
-| `TASK-05` | **Moderate** | `muse-spark-1.3` | `muse-spark-1.3` | `0.92` | `1.93ms` | `537 -> 376` | **-30.0%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Meta API) |
-| `TASK-06` | **Moderate** | `muse-spark-1.3` | `muse-spark-1.3` | `0.98` | `1.82ms` | `551 -> 351` | **-36.3%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Meta API) |
-| `TASK-07` | **Moderate** | `muse-spark-1.3` | `muse-spark-1.3` | `1.00` | `1.89ms` | `527 -> 291` | **-44.8%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Meta API) |
-| `TASK-08` | **Hard** | `muse-wonder-1.0` | `muse-wonder-1.0` | `0.92` | `2.06ms` | `551 -> 424` | **-23.1%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Meta API) |
-| `TASK-09` | **Hard** | `muse-wonder-1.0` | `muse-wonder-1.0` | `0.77` | `2.31ms` | `541 -> 420` | **-22.4%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Meta API) |
-| `TASK-10` | **Hard** | `muse-wonder-1.0` | `muse-wonder-1.0` | `1.00` | `2.24ms` | `783 -> 513` | **-34.5%** | `SUSPECTED_STALE` (1) | ✅ 200 OK (Meta API) |
+---
 
-### Key Quantitative Findings:
-- **Triage Accuracy:** **100.0%** (10 out of 10 tasks correctly routed to their gold target models).
-- **Ysolveth Routing Latency:** **p50 = 1.93 ms** (average 1.94 ms on CPU with attention pooling + calibrated head).
-- **PolyFabric Token Reduction:** **Average -32.8% prompt tokens pruned** while preserving the Target File Invariant at 100%.
-- **Veylqora AST Memory Guard:** 100% precision in flagging background symbol mutations without false alarms.
-- **End-to-End Upstream Execution:** 10 out of 10 tasks returned HTTP 200 OK streamed code patches across Baseten and Meta APIs.
+## Built on bolt.diy
 
+Musegix's browser interface is a modified copy of [bolt.diy](https://github.com/stackblitz-labs/bolt.diy), which is MIT-licensed. The original licence is kept in `vendor/bolt.diy/LICENSE`.
