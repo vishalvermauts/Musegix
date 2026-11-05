@@ -53,7 +53,6 @@ Measured on our own test runs. These are not general guarantees.
 | MBPP+ pass rate by model tier | cheap **83.9%**, mid **90.7%**, strong **87.8%** (378 tasks) | `data/labels/mbpp/full_results.jsonl` |
 
 **Limits**
-- Routing is weaker on hard tasks, so some hard requests go to a cheaper model.
 - Project-file savings depend on project size: small projects save little.
 - Dollar savings are not measured, because model prices are not in this repo.
 - The edit speed-up is not yet proven. Our timing runs did not show a clear gain from the symbol index.
