@@ -60,3 +60,7 @@ Thumbs.db
 
 # Local runtime data: request dumps, gateway logs, Veylqora memory DB
 data/
+
+# Vendored copy of bolt.diy (MIT, see vendor/bolt.diy/VENDORED.md) is tracked
+!vendor/
+!vendor/bolt.diy/

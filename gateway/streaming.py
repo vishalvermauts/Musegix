@@ -5,7 +5,7 @@ import os
 import time
 import traceback
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from fastapi import Request
 from openai import AsyncOpenAI
@@ -137,6 +137,9 @@ def get_default_telemetry_banner(
     selected_tokens: Optional[int] = None,
     raw_tokens: Optional[int] = None,
     stale_memories: Optional[int] = None,
+    tool_raw: Optional[int] = None,
+    tool_kept: Optional[int] = None,
+    impact: Optional[list] = None,
 ) -> str:
     """
     Constructs the telemetry banner for primary coding completions.
@@ -153,10 +156,24 @@ def get_default_telemetry_banner(
 
     stale_str = f"{stale_memories} stale memories detected" if stale_memories is not None else "n/a"
 
+    import json as _json
+
+    status = {
+        "tier": tier,
+        "model": target_model,
+        "triageMs": round(triage_ms, 1) if triage_ms is not None else None,
+        "selectedTokens": selected_tokens,
+        "rawTokens": raw_tokens,
+        "prunedPct": round(((raw_tokens - selected_tokens) / raw_tokens) * 100, 1)
+        if selected_tokens is not None and raw_tokens and raw_tokens > 0 else None,
+        "staleMemories": stale_memories,
+        "toolRaw": tool_raw,
+        "toolKept": tool_kept,
+        "toolPrunedPct": round(((tool_raw - tool_kept) / tool_raw) * 100, 1) if tool_raw and tool_kept is not None and tool_raw > 0 else None,
+        "impact": impact or [],
+    }
     return (
-        f"> ⚡ **Ysolveth Triage**: `{tier}` → `{target_model}` ({triage_str})\n"
-        f"> 🔍 **PolyFabric AST**: {pruned_str}\n"
-        f"> 🧠 **Veylqora Memory**: `ACTIVE` ({stale_str})\n\n"
+        f"```musegix-status\n{_json.dumps(status)}\n```\n\n"
     )
 
 
@@ -170,6 +187,7 @@ async def stream_chat_completion(
     provider: str = "meta",
     fallback: Optional[Tuple[AsyncOpenAI, str, str]] = None,
     extra_banner: Optional[str] = None,
+    on_tool_call: Optional[Callable[[str, dict], None]] = None,
 ) -> AsyncGenerator[str, None]:
     """Proxy one chat completion as SSE.
 
@@ -370,6 +388,7 @@ async def stream_chat_completion(
     finally:
         await _close(upstream)
         _log_stats(target_model, payload, stats)
+        _notify_tool_calls(stats, on_tool_call)
 
     yield "data: [DONE]\n\n"
 
@@ -386,6 +405,30 @@ def _track(stats: Dict[str, Any], chunk_dict: Dict[str, Any]) -> None:
             if fn.get("name"):
                 stats["names"][i] = fn["name"]
             stats["args"][i] = stats["args"].get(i, "") + (fn.get("arguments") or "")
+
+
+def _notify_tool_calls(stats: Dict[str, Any], on_tool_call: Optional[Callable[[str, dict], None]]) -> None:
+    """Hand each completed tool call to the caller as soon as the model finishes generating it.
+
+    Runs before bolt executes the call, so the symbol index learns a file at generation time.
+    """
+    if on_tool_call is None:
+        return
+    for i, name in list(stats.get("names", {}).items()):
+        raw = stats.get("args", {}).get(i, "")
+        try:
+            args = json.loads(raw or "{}")
+        except (ValueError, TypeError):
+            if name == "project_write_file":
+                logger.warning(f"[toolcheck] project_write_file arguments are not valid JSON ({len(raw)} chars): {raw[:80]!r}")
+            continue
+        if name == "project_write_file" and not isinstance(args.get("content"), str):
+            logger.warning(f"[toolcheck] project_write_file missing content; keys={sorted(args.keys())} ({len(raw)} chars)")
+        if isinstance(args, dict):
+            try:
+                on_tool_call(name, args)
+            except Exception as e:  # never break the stream for an index error
+                logger.warning(f"on_tool_call failed for {name}: {e}")
 
 
 def _log_stats(model: str, payload: Dict[str, Any], stats: Dict[str, Any]) -> None:

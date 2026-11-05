@@ -14,6 +14,9 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from gateway.engines.ysolveth_classifier import YsolvethClassifier
 from gateway.engines.polyfabric_pruner import PolyFabricPruner, count_tokens
+from gateway.engines.tool_result_pruner import prune_tool_results
+from gateway.engines.symbol_index import index_for_chat, inject_symbol_map
+from gateway.engines.repair import impact_banner, referenced_mutations, repair_target_file
 from gateway.engines.veylqora_guard import VeylqoraGuard
 from gateway.prompt_extract import latest_user_prompt
 from gateway.tool_choice import (
@@ -100,6 +103,33 @@ def _tool_call_fallback(provider: str):
     if provider == "baseten" and os.getenv("META_API_KEY"):
         return (get_upstream_client(provider="meta"), "muse-spark-1.3", "meta")
     return None
+
+
+# Live activity for the demo runner: the browser polls this to know when an edit has finished.
+ACTIVITY = {"inflight": 0, "finished": 0, "last_finish_at": None, "last_had_tools": None}
+
+
+async def _tracked(gen, counted: bool):
+    if counted:
+        ACTIVITY["inflight"] += 1
+    has_tools = False
+    try:
+        async for chunk in gen:
+            if not has_tools and '"tool_calls"' in chunk:
+                has_tools = True
+            yield chunk
+    finally:
+        if counted:
+            ACTIVITY["inflight"] = max(0, ACTIVITY["inflight"] - 1)
+            ACTIVITY["finished"] += 1
+            ACTIVITY["last_finish_at"] = time.time()
+            # A request that ends with no tool call is the agent's final answer.
+            ACTIVITY["last_had_tools"] = has_tools
+
+
+@router.get("/musegix/activity")
+async def musegix_activity():
+    return ACTIVITY
 
 
 @router.get("/models")
@@ -204,12 +234,46 @@ async def chat_completions(request: Request):
         target_model = model_param
         provider = "meta" if os.getenv("META_API_KEY") else "baseten"
 
+    # Repair escalation: after repeated failed tool results, move this request up one tier.
+    if not is_aux and tier in ("TRIVIAL", "MODERATE"):
+        try:
+            from gateway.engines.repair import escalate_after_failures, tool_failure_flags
+            new_tier = escalate_after_failures(tier, tool_failure_flags(messages))
+            if new_tier != tier:
+                if new_tier == "MODERATE":
+                    target_model, provider = "muse-spark-1.3", "meta"
+                else:
+                    target_model, provider = "muse-wonder-1.0", "meta"
+                logger.info(f"[escalate] {tier} -> {new_tier} after repeated failed tool results: {target_model}")
+                tier = new_tier
+        except Exception as e:
+            logger.warning(f"repair escalation exception: {e}")
+
     # 3. PolyFabric AST Context Pruning & Veylqora Memory Inspection
     selected_tokens = None
     raw_tokens = None
     stale_memories = None
+    symbol_map = ""
+    veylqora_note = None
+    tool_raw = None
+    tool_kept = None
+    impact_map = {}
+    chat_id = None
 
     if not is_aux:
+        chat_id = body.get("session_id") or _chat_session_id(messages)
+        # PolyFabric symbol index: learn from file reads/writes before tool results get pruned.
+        try:
+            if os.getenv("MUSEGIX_SYMBOL_INDEX", "1") == "0":
+                raise RuntimeError("symbol index disabled by MUSEGIX_SYMBOL_INDEX=0")
+            sym_index = index_for_chat(chat_id)
+            sym_index.ingest_messages(messages)
+            symbol_map = sym_index.compact_map(max_tokens=500)
+            if symbol_map:
+                logger.info(f"[symbolmap] {len(sym_index)} files indexed, map {count_tokens(symbol_map)} tokens")
+        except Exception as e:
+            logger.warning(f"PolyFabric symbol index exception: {e}")
+
         # Veylqora must fingerprint the ORIGINAL files, not PolyFabric's pruned stubs,
         # otherwise every pruned background file looks "mutated".
         original_files = {}
@@ -217,6 +281,23 @@ async def chat_completions(request: Request):
             if isinstance(m, dict) and m.get("role") != "system" and isinstance(m.get("content"), str):
                 for match in re.finditer(r'<boltAction\s+type="file"\s+filePath="([^"]+)">\s*(.*?)\s*</boltAction>', m["content"], re.DOTALL):
                     original_files[match.group(1)] = match.group(2)
+
+        # Old, successful tool outputs (file reads, command logs) are resent on every step.
+        # Keep the most recent ones and every failure so the repair loop keeps its evidence.
+        try:
+            messages, tool_before, tool_after = prune_tool_results(messages)
+            tool_raw, tool_kept = (tool_before or None), (tool_after or None)
+            body["messages"] = messages
+            if tool_before:
+                logger.info(f"[polyfabric-tools] old tool results {tool_before} -> {tool_after} tokens")
+        except Exception as e:
+            logger.warning(f"PolyFabric tool-result pruning exception: {e}")
+
+        # Repair step: the newest tool result is a failure naming file:line. Keep that file whole.
+        repair_target = repair_target_file(messages)
+        repair_targets = [repair_target] if repair_target else None
+        if repair_target:
+            logger.info(f"[polyfabric-repair] keeping {repair_target} in full, stubbing the rest")
 
         # Check if there is bolt multi-file context to prune
         for msg in messages:
@@ -228,7 +309,8 @@ async def chat_completions(request: Request):
                         pruner_engine = get_pruner()
                         prune_res = pruner_engine.prune_context(
                             context_text=content,
-                            user_prompt=user_prompt
+                            user_prompt=user_prompt,
+                            target_files=repair_targets,
                         )
                         selected_tokens = (selected_tokens or 0) + prune_res.pruned_tokens
                         raw_tokens = (raw_tokens or 0) + prune_res.raw_tokens
@@ -249,11 +331,30 @@ async def chat_completions(request: Request):
             if extracted_files:
                 rep = guard_engine.inspect_turn(session_id, extracted_files, advance_turn=True)
                 stale_memories = rep.stale_count if hasattr(rep, 'stale_count') else len(rep.mutated_symbols)
+                impact_map = referenced_mutations(getattr(rep, "mutated_symbols", None) or [], extracted_files)
+                veylqora_note = impact_banner(impact_map)
             else:
                 stale_memories = 0
         except Exception as e:
             logger.warning(f"Veylqora check exception: {e}")
             stale_memories = 0
+
+        if symbol_map:
+            messages = inject_symbol_map(messages, symbol_map)
+            body["messages"] = messages
+
+    # Index files as the model generates them (before bolt runs the write).
+    def _index_generated_write(name: str, args: dict) -> None:
+        if name == "project_write_file":
+            path, content = args.get("path"), args.get("content")
+            if isinstance(path, str) and isinstance(content, str):
+                index_for_chat(chat_id).observe(path, content)
+                logger.info(f"[symbolindex] generated {path} ({len(content)} chars) indexed")
+        elif name == "project_patch_file":
+            path, old, new = args.get("path"), args.get("oldText"), args.get("newText")
+            if isinstance(path, str) and isinstance(old, str) and isinstance(new, str):
+                result = index_for_chat(chat_id).apply_patch(path, old, new)
+                logger.info(f"[symbolindex] patch {path}: {result}")
 
     # 4. Telemetry Header Construction
     telemetry_header = None
@@ -266,6 +367,9 @@ async def chat_completions(request: Request):
             selected_tokens=selected_tokens,
             raw_tokens=raw_tokens,
             stale_memories=stale_memories,
+            tool_raw=tool_raw,
+            tool_kept=tool_kept,
+            impact=[{"symbol": k, "files": v[:3]} for k, v in list(impact_map.items())[:5]],
         )
         # bolt.diy attaches the project snapshot only from the 2nd agent step on, after the
         # first-step banner has gone out. Report the first real pruning of each prompt once.
@@ -276,10 +380,24 @@ async def chat_completions(request: Request):
                 if len(_PRUNE_REPORTED) > 500:
                     _PRUNE_REPORTED.pop(next(iter(_PRUNE_REPORTED)))
                 pct = (raw_tokens - selected_tokens) / raw_tokens * 100
-                extra_banner = (
-                    f"> 🔍 **PolyFabric AST**: `{selected_tokens}` tokens vs `{raw_tokens}` raw "
-                    f"({pct:.1f}% pruned)\n\n"
+                # Later steps send the same status block, so the sticky bar gets the project-file values too.
+                extra_banner = get_default_telemetry_banner(
+                    tier=tier,
+                    target_model=target_model,
+                    triage_ms=triage_ms,
+                    selected_tokens=selected_tokens,
+                    raw_tokens=raw_tokens,
+                    stale_memories=stale_memories,
+                    tool_raw=tool_raw,
+                    tool_kept=tool_kept,
+                    impact=[{"symbol": k, "files": v[:3]} for k, v in list(impact_map.items())[:5]],
                 )
+
+    if veylqora_note and not is_aux:
+        # The first-step banner is the telemetry header; later steps use extra_banner.
+        extra_banner = (extra_banner or "") + veylqora_note
+        if telemetry_header:
+            telemetry_header += veylqora_note
 
     client = get_upstream_client(provider=provider)
     # OpenAI spec: an absent "stream" means a non-streaming JSON response. bolt.diy's
@@ -288,7 +406,7 @@ async def chat_completions(request: Request):
 
     if stream:
         return StreamingResponse(
-            stream_chat_completion(
+            _tracked(stream_chat_completion(
                 payload=body,
                 request=request,
                 target_model=target_model,
@@ -298,7 +416,8 @@ async def chat_completions(request: Request):
                 provider=provider,
                 fallback=_tool_call_fallback(provider),
                 extra_banner=extra_banner,
-            ),
+                on_tool_call=_index_generated_write if (not is_aux and os.getenv("MUSEGIX_SYMBOL_INDEX", "1") != "0") else None,
+            ), counted=not is_aux),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

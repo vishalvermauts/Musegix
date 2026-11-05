@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List
 
 _MODEL_RE = re.compile(r"^\s*\[Model: [^\]\n]*\]\s*", re.IGNORECASE)
+_BOLT_ARTIFACT_RE = re.compile(r"<boltArtifact\b[\s\S]*?</boltArtifact>", re.IGNORECASE)
 _PROVIDER_RE = re.compile(r"^\s*\[Provider: [^\]\n]*\]\s*", re.IGNORECASE)
 
 
@@ -44,7 +45,9 @@ def latest_user_prompt(messages: List[Dict[str, Any]]) -> str:
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
             continue
         raw = _text_of(msg.get("content"))
-        cleaned = clean_user_prompt(raw)
+        # bolt.diy appends the typed request AFTER its "User Updated Files" code snapshot
+        # (<boltArtifact> block) in the same user message: keep only the typed part.
+        cleaned = clean_user_prompt(_BOLT_ARTIFACT_RE.sub("", raw)).strip()
         if not cleaned:
             continue
         if _MODEL_RE.match(raw):

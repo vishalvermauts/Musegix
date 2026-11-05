@@ -27,3 +27,18 @@ def test_list_content_parts():
 
 def test_fallback_without_header():
     assert latest_user_prompt([{"role": "user", "content": "Add an About page"}]) == "Add an About page"
+
+
+def test_bolt_updated_files_snapshot_is_not_the_prompt():
+    from gateway.prompt_extract import latest_user_prompt
+    msgs = [
+        {"role": "user", "content": "[Model: m]\n\n[Provider: p]\n\nRename the app to MetaDesk."},
+        {"role": "user", "content": "[Model: m]\n\n[Provider: p]\n\n\n<boltArtifact id=\"1\" title=\"User Updated Files\">\n<boltAction type=\"file\" filePath=\"a.tsx\">x</boltAction></boltArtifact>"},
+    ]
+    assert latest_user_prompt(msgs) == "Rename the app to MetaDesk."
+
+
+def test_typed_request_after_artifact_snapshot_is_extracted():
+    from gateway.prompt_extract import latest_user_prompt
+    msgs = [{"role": "user", "content": "[Model: m]\n\n[Provider: p]\n\n\n<boltArtifact id=\"1\"><boltAction type=\"file\" filePath=\"a.tsx\">const x = 1;</boltAction></boltArtifact>\n  Rename the app to MetaDesk."}]
+    assert latest_user_prompt(msgs) == "Rename the app to MetaDesk."
